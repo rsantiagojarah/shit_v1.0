@@ -838,7 +838,7 @@ def execute_shit_command(args):
     
     # Ejecutar el comando correspondiente
     if args and args[0] == "add":
-        if len(args) > 1 and args[1] == "-A":
+        if "-A" in args or "--all" in args:
             return vcs.add_all()
         elif len(args) > 1:
             # Si estamos en el directorio de trabajo (no en el repo oculto)
@@ -1115,6 +1115,9 @@ def main():
                 init_repo()
             elif sys.argv[1] == "setup":
                 setup_shit()
+            elif sys.argv[1] == "add" and len(sys.argv) > 2 and sys.argv[2] == "-A":
+                vcs = SHIT()
+                vcs.add_all()
             else:
                 # Pasar todos los argumentos directamente al comando
                 execute_shit_command(sys.argv[1:])
@@ -1123,6 +1126,7 @@ def main():
             print("Comandos disponibles:")
             print("  init             - Inicializa un repositorio")
             print("  add <archivo>    - Añade un archivo al control de versiones")
+            print("  add -A          - Añade todos los archivos modificados")
             print("  commit <archivo> -m <mensaje> - Guarda una nueva versión")
             print("  log <archivo>    - Muestra el historial de versiones")
             print("  checkout <archivo> <versión> - Recupera una versión")

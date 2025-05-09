@@ -44,19 +44,37 @@ else:
 FILE_ATTRIBUTE_HIDDEN = 0x02
 
 def hide_directory(path):
-    """Oculta un directorio en Windows."""
+    """Oculta un directorio en Windows usando múltiples métodos."""
     if platform.system() == "Windows":
+        # Convertir path a string para asegurar compatibilidad
+        path_str = str(path)
+        
+        # Método 1: Usar la API de Windows (SetFileAttributes)
         try:
-            # Asegurarse de que los permisos son correctos antes de ocultar
-            # En Windows, ocultar un directorio puede afectar los permisos de escritura
-            # para algunas operaciones
+            ret = ctypes.windll.kernel32.SetFileAttributesW(path_str, FILE_ATTRIBUTE_HIDDEN)
+            if ret != 0:
+                return True  # Éxito con el primer método
+        except Exception as e:
+            print(f"Info: No se pudo ocultar con SetFileAttributes: {str(e)}")
+        
+        # Método 2: Usar el comando attrib del sistema
+        try:
+            # Usar shell=True para mayor compatibilidad
+            subprocess.run(['attrib', '+h', path_str], shell=True, check=False)
+            return True
+        except Exception as e:
+            print(f"Info: No se pudo ocultar con attrib: {str(e)}")
             
-            # Usar la API de Windows para establecer el atributo de archivo oculto
-            ret = ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
-            if ret == 0:  # Si falla, intentar con el comando attrib
-                subprocess.run(['attrib', '+h', str(path)], shell=True, check=False)
+        # Método 3: Usar comando attrib con cmd /c para mayor compatibilidad
+        try:
+            cmd = f'cmd /c attrib +h "{path_str}"'
+            subprocess.run(cmd, shell=True, check=False)
+            return True
         except Exception as e:
             print(f"Advertencia: No se pudo ocultar el directorio {path}: {str(e)}")
+            print("IMPORTANTE: La carpeta .shit está visible. Para ocultarla manualmente, use:")
+            print(f'attrib +h "{path_str}"')
+            return False
 
 class SHIT:
     """Clase principal para el control de versiones de archivos binarios."""
@@ -99,11 +117,22 @@ class SHIT:
         # Inicializar rama master (por defecto)
         self._set_head("master")
         
+        # Inicializar reflog
+        reflog_file = self.vcs_dir / 'reflog'
+        with open(reflog_file, 'w') as f:
+            f.write("")
+        
+        # Registrar la inicialización en el reflog
+        self._add_to_reflog("init", "master")
+        
+        # Ocultar el directorio en Windows
+        hide_directory(self.vcs_dir)
+        
         print(f"Repositorio inicializado en: {self.repo_path}")
         return True
 
     def add(self, file_path):
-        """Añade un archivo al control de versiones."""
+        """Añade un archivo al control de versiones o marca archivos modificados para commit."""
         file_path = Path(file_path)
         
         if not file_path.exists():
@@ -120,96 +149,272 @@ class SHIT:
         try:
             # Intentar calcular ruta relativa al repositorio
             rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-            str_path = str(rel_path)
+            str_path = str(rel_path).replace(os.path.sep, '/')  # Normalizar separadores
         except ValueError:
             # Si no es posible calcular la ruta relativa (porque el archivo está fuera del repo),
             # usar el nombre del archivo como identificador
             str_path = file_path.name
         
-        # Añadir archivo al índice
-        self.index[str_path] = {
-            'added_at': datetime.datetime.now().isoformat(),
-            'versions': []
-        }
-        
-        self._save_index()
-        print(f"Archivo {str_path} añadido al control de versiones.")
-        return True
+        # Verificar si el archivo ya está en el índice
+        if str_path in self.index:
+            # El archivo ya está en el índice, verificar si ha sido modificado
+            current_branch = self._get_current_branch()
+            info = self.index[str_path]
+            versions = info.get('versions', [])
+            branch_versions = [v for v in versions if v.get('branch', 'master') == current_branch]
+            
+            if branch_versions:
+                # Tiene versiones previas en esta rama, verificar si se modificó
+                latest_version = branch_versions[-1]
+                hash_original = latest_version['hash']
+                
+                # Calcular el hash actual
+                try:
+                    with open(file_path, 'rb') as f:
+                        contenido = f.read()
+                    hash_actual = hashlib.sha256(contenido).hexdigest()
+                    
+                    if hash_actual != hash_original:
+                        # El archivo ha sido modificado
+                        print(f"Archivo modificado {str_path} marcado para commit.")
+                        return True
+                    else:
+                        # El archivo no ha sido modificado
+                        print(f"El archivo {str_path} no ha sido modificado desde el último commit.")
+                        return True
+                except Exception as e:
+                    print(f"Error al leer el archivo {str_path}: {str(e)}")
+                    return False
+            else:
+                # No tiene versiones en esta rama, está listo para commit
+                print(f"Archivo {str_path} ya está añadido y listo para commit.")
+                return True
+        else:
+            # Añadir archivo nuevo al índice
+            self.index[str_path] = {
+                'added_at': datetime.datetime.now().isoformat(),
+                'versions': []
+            }
+            
+            self._save_index()
+            print(f"Archivo {str_path} añadido al control de versiones.")
+            return True
 
     def add_all(self):
-        """Añade todos los archivos modificados al control de versiones."""
+        """Añade todos los archivos modificados y nuevos al control de versiones."""
         # Cargar el índice actual
         self._load_index()
         
-        # Obtener todos los archivos en el directorio del repositorio
-        added_files = []
+        # Obtener la rama actual
+        current_branch = self._get_current_branch()
+        
+        # Variables para tracking
+        added_files = []  # Archivos nuevos añadidos
+        updated_files = []  # Archivos modificados re-añadidos
+        
+        # 1. Procesar archivos ya en el índice (modificados)
+        for file_path, info in list(self.index.items()):
+            # Convertir / a \ para Windows si es necesario
+            file_sys_path = file_path.replace('/', os.path.sep)
+            abs_path = self.repo_path / file_sys_path
+            
+            # Verificar si el archivo existe
+            if not abs_path.exists():
+                continue
+                
+            # Verificar si tiene versiones en la rama actual
+            versions = info.get('versions', [])
+            branch_versions = [v for v in versions if v.get('branch', 'master') == current_branch]
+            
+            if not branch_versions:
+                continue  # No tiene versiones en esta rama, no hay "modificación"
+                
+            # Obtener el hash de la última versión
+            latest_version = branch_versions[-1]
+            hash_original = latest_version['hash']
+            
+            # Calcular el hash actual
+            try:
+                with open(abs_path, 'rb') as f:
+                    contenido = f.read()
+                hash_actual = hashlib.sha256(contenido).hexdigest()
+                
+                # Si los hashes son diferentes, el archivo ha sido modificado
+                if hash_actual != hash_original:
+                    # "Re-añadir" archivo modificado (marcar como listo para commit)
+                    # En nuestro sistema, esto no requiere una acción especial
+                    # ya que los archivos ya están en el índice
+                    updated_files.append(file_path)
+            except Exception:
+                pass
+        
+        # 2. Encontrar y añadir archivos sin seguimiento
+        # Crear un conjunto con todas las rutas normalizadas en el índice
+        rutas_en_indice = set()
+        for str_path in self.index.keys():
+            # Normalizar la ruta para comparaciones
+            ruta_normalizada = str_path.replace('\\', '/')
+            rutas_en_indice.add(ruta_normalizada)
+        
+        # Primero, obtener todos los archivos en disco
+        archivos_en_disco = set()
+        
+        # Método 1: Usar os.walk para encontrar todos los archivos en todas las carpetas
         for root, _, files in os.walk(self.repo_path):
+            # Ignorar el directorio .shit y otros directorios ocultos
+            if '.shit' in root or os.path.basename(root).startswith('.'):
+                continue
+                
             for file in files:
-                # Ignorar archivos en el directorio .shit
-                if '.shit' in root:
+                # Ignorar archivos ocultos
+                if file.startswith('.'):
                     continue
                     
-                file_path = Path(root) / file
+                file_path = os.path.join(root, file)
                 try:
-                    # Intentar calcular ruta relativa al repositorio
-                    rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-                    str_path = str(rel_path)
-                except ValueError:
+                    # Convertir a ruta relativa
+                    rel_path = os.path.relpath(file_path, self.repo_path)
+                    # Normalizar para comparación (siempre usar /)
+                    rel_path_norm = rel_path.replace(os.path.sep, '/')
+                    archivos_en_disco.add(rel_path_norm)
+                except Exception as e:
+                    print(f"Error al procesar archivo {file_path}: {str(e)}")
                     continue
-                
-                # Añadir archivo al índice si no está ya incluido
-                if str_path not in self.index:
-                    self.index[str_path] = {
-                        'added_at': datetime.datetime.now().isoformat(),
-                        'versions': []
-                    }
-                    added_files.append(str_path)
         
-        if added_files:
+        # Método 2: Verificar explícitamente los archivos en el directorio raíz
+        for item in os.listdir(self.repo_path):
+            item_path = os.path.join(self.repo_path, item)
+            # Solo incluir archivos (no directorios) y que no estén ocultos
+            if os.path.isfile(item_path) and not item.startswith('.'):
+                rel_path = os.path.relpath(item_path, self.repo_path)
+                rel_path_norm = rel_path.replace(os.path.sep, '/')
+                archivos_en_disco.add(rel_path_norm)
+        
+        # Encontrar archivos sin seguimiento (en disco pero no en el índice)
+        for archivo in archivos_en_disco:
+            if archivo not in rutas_en_indice:
+                # Añadir archivo nuevo al índice
+                self.index[archivo] = {
+                    'added_at': datetime.datetime.now().isoformat(),
+                    'versions': []
+                }
+                added_files.append(archivo)
+        
+        if added_files or updated_files:
             self._save_index()
-            print("Archivos añadidos al control de versiones:")
-            for file in added_files:
-                print(f"  {file}")
+            
+            if added_files:
+                print("Archivos nuevos añadidos al control de versiones:")
+                for file in sorted(added_files):
+                    print(f"  {file}")
+            
+            if updated_files:
+                print("Archivos modificados marcados para commit:")
+                for file in sorted(updated_files):
+                    print(f"  {file}")
         else:
-            print("No hay archivos nuevos para añadir.")
+            print("No hay archivos nuevos ni modificados para añadir.")
             
         return True
 
-    def commit(self, file_path, message, branch=None):
-        """Guarda una nueva versión del archivo."""
-        file_path = Path(file_path)
-        
-        if not file_path.exists():
-            print(f"Error: El archivo {file_path} no existe.")
-            return False
-            
-        try:
-            # Intentar calcular ruta relativa al repositorio
-            rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-            str_path = str(rel_path)
-        except ValueError:
-            # Si no es posible calcular la ruta relativa, usar el nombre del archivo
-            str_path = file_path.name
-        
-        # Cargar el índice
-        self._load_index()
-        
-        # Verificar que el archivo está en el índice
-        if str_path not in self.index:
-            print(f"Error: El archivo {str_path} no está bajo control de versiones. Usa 'add' primero.")
-            return False
-            
-        # Leer el contenido del archivo
-        with open(file_path, 'rb') as f:
-            content = f.read()
-            
-        # Calcular hash del contenido
-        content_hash = hashlib.sha256(content).hexdigest()
-        
+    def commit(self, file_path=None, message="", branch=None):
+        """Guarda una nueva versión del archivo o de todos los archivos en staging."""
         # Obtener la rama actual si no se especificó una
         if branch is None:
             branch = self._get_current_branch()
             
+        # Cargar el índice
+        self._load_index()
+        
+        if file_path is None:
+            # Modo commit de todos los archivos en staging (sin commit previo)
+            if not message:
+                print("Error: Debe proporcionar un mensaje para el commit con -m")
+                return False
+            
+            # Contar cuántos archivos se procesaron
+            archivos_commiteados = 0
+            ultimo_hash = None  # Para actualizar la rama
+            
+            # Iterar sobre todos los archivos en el índice
+            for str_path, info in list(self.index.items()):
+                file_sys_path = str_path.replace('/', os.path.sep)
+                file_abs_path = self.repo_path / file_sys_path
+                
+                # Verificar si el archivo existe
+                if not file_abs_path.exists():
+                    print(f"Advertencia: El archivo {str_path} no existe, se omitirá.")
+                    continue
+                
+                # Verificar si el archivo tiene versiones para esta rama
+                versiones = info.get('versions', [])
+                branch_versions = [v for v in versiones if v.get('branch', 'master') == branch]
+                
+                # Calcular el hash actual
+                try:
+                    with open(file_abs_path, 'rb') as f:
+                        contenido = f.read()
+                    hash_actual = hashlib.sha256(contenido).hexdigest()
+                except Exception as e:
+                    print(f"Error al leer archivo {str_path}: {str(e)}")
+                    continue
+                
+                # Si no tiene versiones o el hash ha cambiado, hacer commit
+                if not branch_versions or branch_versions[-1]['hash'] != hash_actual:
+                    # Crear un commit para este archivo
+                    if self._commit_file(file_abs_path, str_path, message, branch, update_branch=False):
+                        # Guardar el hash para actualizar la rama al final
+                        ultimo_hash = hash_actual
+                        archivos_commiteados += 1
+            
+            if archivos_commiteados > 0 and ultimo_hash:
+                # Actualizar la rama para que apunte al último hash
+                self._update_branch_ref(branch, ultimo_hash)
+                # Añadir al reflog
+                self._add_to_reflog(f"commit: {message} ({archivos_commiteados} archivos)", branch)
+                
+                print(f"Commit creado: {message} ({archivos_commiteados} archivos)")
+                return True
+            else:
+                print("No hay archivos para commit. Use 'shit add' para añadir archivos.")
+                return False
+        else:
+            # Modo commit de un archivo específico
+            file_path = Path(file_path)
+            
+            if not file_path.exists():
+                print(f"Error: El archivo {file_path} no existe.")
+                return False
+                
+            try:
+                # Intentar calcular ruta relativa al repositorio
+                rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+                str_path = str(rel_path).replace(os.path.sep, '/')  # Normalizar separadores
+            except ValueError:
+                # Si no es posible calcular la ruta relativa, usar el nombre del archivo
+                str_path = file_path.name
+            
+            # Verificar que el archivo está en el índice
+            if str_path not in self.index:
+                print(f"Error: El archivo {str_path} no está bajo control de versiones. Usa 'add' primero.")
+                return False
+                
+            # Hacer commit del archivo específico - actualizar la rama en este caso
+            return self._commit_file(file_path, str_path, message, branch, update_branch=True)
+            
+    def _commit_file(self, file_path, str_path, message, branch, update_branch=True):
+        """Método interno para hacer commit de un archivo específico"""
+        # Leer el contenido del archivo
+        try:
+            with open(file_path, 'rb') as f:
+                content = f.read()
+        except Exception as e:
+            print(f"Error al leer el archivo {str_path}: {str(e)}")
+            return False
+            
+        # Calcular hash del contenido
+        content_hash = hashlib.sha256(content).hexdigest()
+        
         # Verificar si esta versión ya existe
         versions = self.index[str_path]['versions']
         branch_versions = [v for v in versions if v.get('branch', 'master') == branch]
@@ -255,47 +460,55 @@ class SHIT:
         self.index[str_path]['versions'].append(version_info)
         self._save_index()
         
-        # Actualizar la referencia de la rama
-        self._update_branch_ref(branch, content_hash)
+        # Actualizar la referencia de la rama si se solicita
+        if update_branch:
+            self._update_branch_ref(branch, content_hash)
+            # Registrar el commit en el reflog
+            self._add_to_reflog(f"commit {str_path}: {message}", branch)
         
         print(f"Nueva versión de {str_path} guardada (v{version_info['version']}) en rama {branch}.")
         return True
 
-    def log(self, file_path, branch=None):
-        """Muestra el historial de versiones de un archivo."""
-        file_path = Path(file_path)
+    def log(self, file_path=None, branch=None):
+        """Muestra el historial de versiones de un archivo o de todos los archivos si no se especifica."""
+        self._load_index()
         
+        if file_path is None:
+            # Mostrar historial de todos los archivos
+            if not self.index:
+                print("No hay archivos bajo control de versiones.")
+                return True
+            for str_path in self.index:
+                print(f"\n{'='*70}\nHistorial de: {str_path}")
+                self.log(str_path, branch)
+            return True
+        
+        file_path = Path(file_path)
         try:
-            # Intentar calcular ruta relativa al repositorio
             rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
             str_path = str(rel_path)
-        except ValueError:
-            # Si no es posible calcular la ruta relativa, usar el nombre del archivo
-            str_path = file_path.name
-        
-        # Cargar el índice
-        self._load_index()
+        except Exception:
+            str_path = str(file_path)
         
         # Verificar que el archivo está en el índice
         if str_path not in self.index:
             print(f"Error: El archivo {str_path} no está bajo control de versiones.")
             return False
-            
+        
         # Obtener la rama actual si no se especificó una
         if branch is None:
             branch = self._get_current_branch()
-            
+        
         # Filtrar versiones por rama
         all_versions = self.index[str_path]['versions']
         versions = [v for v in all_versions if v.get('branch', 'master') == branch]
-            
+        
         if not versions:
             print(f"El archivo {str_path} no tiene versiones guardadas en la rama {branch}.")
             return True
-            
+        
         print(f"\nHistorial de versiones para {str_path} (rama {branch}):")
         print("-" * 60)
-        
         for version in versions:
             timestamp = datetime.datetime.fromisoformat(version['timestamp'])
             formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S")
@@ -304,7 +517,6 @@ class SHIT:
             print(f"Hash: {version['hash']}")
             print(f"Mensaje: {version['message']}")
             print("-" * 60)
-        
         return True
 
     def checkout(self, file_path, version, branch=None):
@@ -436,6 +648,10 @@ class SHIT:
             print(f"Error: La rama '{branch_name}' no existe.")
             return False
             
+        # Registrar el cambio de rama en el reflog
+        current_branch = self._get_current_branch()
+        self._add_to_reflog(f"branch switch {branch_name}", current_branch)
+        
         # Cambiar a la rama especificada
         self._set_head(branch_name)
         print(f"Cambiado a la rama '{branch_name}'.")
@@ -462,6 +678,9 @@ class SHIT:
             print(f"Error: La rama destino '{target_branch}' no existe.")
             return False
             
+        # Registrar la fusión en el reflog
+        self._add_to_reflog(f"branch merge {source_branch} -> {target_branch}", target_branch)
+        
         # Cargar el índice
         self._load_index()
         
@@ -636,6 +855,231 @@ class SHIT:
                 self.index = json.load(f)
         else:
             self.index = {}
+
+    def status(self):
+        """Muestra el estado de los archivos: modificados, añadidos y sin seguimiento."""
+        # Cargar el índice
+        self._load_index()
+        
+        # Inicializar listas para cada categoría
+        modificados = []
+        sin_commit = []
+        sin_seguimiento = []
+        
+        # Crear un conjunto con todas las rutas normalizadas en el índice
+        rutas_en_indice = set()
+        for str_path in self.index.keys():
+            # Normalizar la ruta para comparaciones
+            # Convertir todas las barras a formato Unix (/) para consistencia
+            ruta_normalizada = str_path.replace('\\', '/')
+            rutas_en_indice.add(ruta_normalizada)
+        
+        # Obtener la rama actual
+        branch = self._get_current_branch()
+        print(f"\nEstado de la rama '{branch}':")
+        
+        # Analizar todos los archivos bajo control de versiones
+        for file_path, info in self.index.items():
+            # Convertir la ruta para el sistema operativo actual
+            file_sys_path = file_path.replace('/', os.path.sep)
+            abs_path = self.repo_path / file_sys_path
+            
+            # Si el archivo no existe en disco, ha sido eliminado
+            if not abs_path.exists():
+                modificados.append(f"eliminado: {file_path}")
+                continue
+                
+            # Verificar si el archivo tiene versiones
+            if not info.get('versions'):
+                sin_commit.append(file_path)
+                continue
+                
+            # Filtrar versiones para la rama actual
+            versiones_rama = [v for v in info['versions'] if v.get('branch', 'master') == branch]
+            if not versiones_rama:
+                sin_commit.append(file_path)
+                continue
+                
+            # Obtener la última versión y comparar con el contenido actual
+            ultima_version = versiones_rama[-1]
+            hash_original = ultima_version['hash']
+            
+            # Leer el contenido actual y calcular su hash
+            try:
+                with open(abs_path, 'rb') as f:
+                    contenido = f.read()
+                hash_actual = hashlib.sha256(contenido).hexdigest()
+                
+                # Si los hashes son diferentes, el archivo ha sido modificado
+                if hash_actual != hash_original:
+                    modificados.append(f"modificado: {file_path}")
+            except Exception:
+                modificados.append(f"error al leer: {file_path}")
+        
+        # Recolectar todos los archivos del sistema de archivos
+        archivos_en_disco = set()
+        
+        # Método 1: Usar os.walk para encontrar todos los archivos en todas las carpetas
+        for root, _, files in os.walk(self.repo_path):
+            # Ignorar el directorio .shit y otros directorios ocultos
+            if '.shit' in root or os.path.basename(root).startswith('.'):
+                continue
+                
+            for file in files:
+                # Ignorar archivos ocultos
+                if file.startswith('.'):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                try:
+                    # Convertir a ruta relativa para comparar con el índice
+                    rel_path = os.path.relpath(file_path, self.repo_path)
+                    # Normalizar la ruta con / para comparar correctamente
+                    rel_path = rel_path.replace(os.path.sep, '/')
+                    archivos_en_disco.add(rel_path)
+                except Exception as e:
+                    print(f"Error al procesar archivo {file_path}: {str(e)}")
+                    continue
+        
+        # Método 2: Verificar explícitamente los archivos en el directorio raíz
+        for item in os.listdir(self.repo_path):
+            item_path = os.path.join(self.repo_path, item)
+            # Solo incluir archivos (no directorios) y que no estén ocultos
+            if os.path.isfile(item_path) and not item.startswith('.'):
+                rel_path = os.path.relpath(item_path, self.repo_path)
+                rel_path = rel_path.replace(os.path.sep, '/')
+                archivos_en_disco.add(rel_path)
+        
+        # Encontrar archivos sin seguimiento (en disco pero no en el índice)
+        for archivo in archivos_en_disco:
+            # Normalizar ruta para comparación consistente
+            archivo_normalizado = archivo.replace('\\', '/')
+            if archivo_normalizado not in rutas_en_indice:
+                sin_seguimiento.append(archivo_normalizado)
+        
+        # Mostrar los resultados
+        if modificados:
+            print("\nArchivos modificados:")
+            for file in sorted(modificados):
+                print(f"  {file}")
+                
+        if sin_commit:
+            print("\nArchivos añadidos al control de versiones (sin commit):")
+            for file in sorted(sin_commit):
+                print(f"  {file}")
+                
+        if sin_seguimiento:
+            print("\nArchivos sin seguimiento:")
+            for file in sorted(sin_seguimiento):
+                print(f"  {file}")
+                
+        if not modificados and not sin_commit and not sin_seguimiento:
+            print("No hay cambios en los archivos.")
+            
+        return True
+
+    def reset(self, commit_hash, mode="soft"):
+        """Retrocede HEAD a un commit específico.
+        
+        Modos:
+        - soft: Retrocede HEAD y deja cambios en staging
+        """
+        # Verificar que el modo es válido
+        if mode not in ["soft"]:
+            print(f"Error: Modo '{mode}' no soportado. Use 'soft'.")
+            return False
+            
+        # Cargar el índice
+        self._load_index()
+        
+        # Verificar que el hash existe en algún archivo
+        hash_exists = False
+        affected_files = []
+        
+        for file_path, info in self.index.items():
+            versions = info.get('versions', [])
+            for version in versions:
+                if version.get('hash') == commit_hash:
+                    hash_exists = True
+                    affected_files.append((file_path, version))
+        
+        if not hash_exists:
+            print(f"Error: No se encontró ningún commit con hash '{commit_hash}'.")
+            return False
+            
+        # Obtener la rama actual
+        current_branch = self._get_current_branch()
+        
+        # Guardar el estado actual en reflog
+        self._add_to_reflog(f"reset --{mode} {commit_hash}", current_branch)
+        
+        # Actualizar la referencia de la rama
+        self._update_branch_ref(current_branch, commit_hash)
+        
+        print(f"HEAD retrocedió a {commit_hash} en modo {mode}.")
+        print(f"Archivos afectados: {len(affected_files)}")
+        
+        return True
+        
+    def reflog(self):
+        """Muestra el historial de movimientos de HEAD."""
+        reflog_file = self.vcs_dir / 'reflog'
+        
+        if not reflog_file.exists():
+            print("No hay historial de movimientos de HEAD.")
+            return True
+            
+        try:
+            with open(reflog_file, 'r') as f:
+                entries = f.readlines()
+                
+            print("\nHistorial de movimientos de HEAD:")
+            print("-" * 60)
+            
+            # Mostrar entradas del más reciente al más antiguo
+            for entry in reversed(entries):
+                entry = entry.strip()
+                if entry:
+                    # Formato: timestamp|hash|command|branch
+                    parts = entry.split('|')
+                    if len(parts) >= 4:
+                        timestamp, hash_val, command, branch = parts[:4]
+                        # Convertir timestamp a formato legible
+                        dt = datetime.datetime.fromtimestamp(float(timestamp))
+                        formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"{hash_val[:8]} - {formatted_time} - {branch}: {command}")
+            
+            print("-" * 60)
+            return True
+        except Exception as e:
+            print(f"Error al leer el reflog: {str(e)}")
+            return False
+    
+    def _add_to_reflog(self, command, branch):
+        """Añade una entrada al reflog."""
+        reflog_file = self.vcs_dir / 'reflog'
+        
+        # Obtener el hash actual de la rama
+        branch_file = self.branches_dir / branch
+        current_hash = ""
+        
+        if branch_file.exists():
+            try:
+                with open(branch_file, 'r') as f:
+                    current_hash = f.read().strip()
+            except Exception:
+                pass
+        
+        # Crear la entrada del reflog
+        timestamp = time.time()
+        entry = f"{timestamp}|{current_hash}|{command}|{branch}\n"
+        
+        # Añadir al archivo
+        try:
+            with open(reflog_file, 'a+') as f:
+                f.write(entry)
+        except Exception as e:
+            print(f"Advertencia: No se pudo actualizar el reflog: {str(e)}")
 
 
 # Funciones para el modo local (como Git)
@@ -848,7 +1292,7 @@ def execute_shit_command(args):
         else:
             print("Error: Debe especificar un archivo o usar la opción -A para añadir todos los archivos.")
             return False
-    elif args and args[0] == "commit" and len(args) > 1:
+    elif args and args[0] == "commit":
         if "-m" in args:
             msg_index = args.index("-m") + 1
             if msg_index < len(args):
@@ -866,9 +1310,29 @@ def execute_shit_command(args):
             if b_index < len(args):
                 branch = args[b_index]
         
-        # Usar ruta absoluta 
-        abs_path = os.path.abspath(args[1])
-        return vcs.commit(abs_path, message, branch)
+        # Verificar si hay un archivo específico o si es un commit general
+        file_path = None
+        # Buscar si hay un archivo para commit que no sea parte de una opción
+        for i, arg in enumerate(args):
+            # El primer argumento es "commit", omitirlo
+            if i == 0:
+                continue
+            # Omitir las opciones y sus valores
+            if arg.startswith("-"):
+                continue
+            if i > 0 and args[i-1].startswith("-"):
+                continue
+            # Si encontramos un argumento que no es una opción ni valor de opción, es el archivo
+            file_path = arg
+            break
+            
+        if file_path:
+            # Usar ruta absoluta si se especificó un archivo
+            abs_path = os.path.abspath(file_path)
+            return vcs.commit(abs_path, message, branch)
+        else:
+            # Commit de todos los archivos en staging
+            return vcs.commit(None, message, branch)
     elif args and args[0] == "log" and len(args) > 1:
         branch = None
         if "-b" in args:
@@ -941,8 +1405,47 @@ def execute_shit_command(args):
                 return vcs.remote_share(args[2], role)
         print("Comando remoto no válido")
         return False
+    elif args and args[0] == "status":
+        return vcs.status()
+    elif args and args[0] == "reset":
+        if len(args) > 1:
+            mode = "soft"
+            if "-m" in args:
+                m_index = args.index("-m") + 1
+                if m_index < len(args):
+                    mode = args[m_index]
+            elif "--mode" in args:
+                m_index = args.index("--mode") + 1
+                if m_index < len(args):
+                    mode = args[m_index]
+            # Reconocer --soft como una opción específica
+            elif "--soft" in args:
+                mode = "soft"
+            return vcs.reset(args[1], mode)
+    elif args and args[0] == "reflog":
+        return vcs.reflog()
     else:
-        print(f"Comando no reconocido o faltan argumentos: {args}")
+        print("Uso: shit <comando> [argumentos]")
+        print("Comandos disponibles:")
+        print("  init             - Inicializa un repositorio")
+        print("  add <archivo>    - Añade un archivo al control de versiones")
+        print("  add -A          - Añade todos los archivos modificados")
+        print("  commit -m \"mensaje\" - Guarda versión de todos los archivos en staging")
+        print("  commit <archivo> -m \"mensaje\" - Guarda versión de un archivo específico")
+        print("  log <archivo>    - Muestra el historial de versiones")
+        print("  status           - Muestra archivos modificados, añadidos y sin seguimiento")
+        print("  checkout <archivo> <versión> - Recupera una versión")
+        print("  branch create <nombre> - Crea una nueva rama")
+        print("  branch list      - Lista las ramas disponibles")
+        print("  branch switch <nombre> - Cambia a otra rama")
+        print("  branch merge <origen> [destino] - Fusiona ramas")
+        print("  remote init <nombre> - Inicializa un repositorio remoto en Google Drive")
+        print("  remote clone <repo_id> [target_dir] - Clona un repositorio desde Google Drive")
+        print("  remote push [-b branch] - Envía cambios al repositorio remoto")
+        print("  remote pull [-b branch] - Obtiene cambios desde el repositorio remoto")
+        print("  remote share <email> [-r role] - Comparte el repositorio con otro usuario")
+        print("  reset <commit_hash> [-m mode] - Retrocede HEAD a un commit específico")
+        print("  reflog           - Muestra el historial de movimientos de HEAD")
         return False
 
 
@@ -976,20 +1479,20 @@ def add(file, all):
 
 
 @cli.command()
-@click.argument('file', required=True, type=click.Path(exists=True))
+@click.argument('file', required=False, type=click.Path(exists=True))
 @click.option('-m', '--message', required=True, help='Mensaje descriptivo de la versión')
 @click.option('-b', '--branch', help='Rama en la que se guardará la versión')
 def commit(file, message, branch):
-    """Guarda una nueva versión de un archivo."""
+    """Guarda una nueva versión de un archivo o de todos los archivos en staging."""
     vcs = SHIT()
     vcs.commit(file, message, branch)
 
 
 @cli.command()
-@click.argument('file', required=True, type=click.Path(exists=True))
+@click.argument('file', required=False)
 @click.option('-b', '--branch', help='Rama específica a consultar')
 def log(file, branch):
-    """Muestra el historial de versiones de un archivo."""
+    """Muestra el historial de versiones de un archivo o de todos los archivos si no se especifica."""
     vcs = SHIT()
     vcs.log(file, branch)
 
@@ -1094,49 +1597,37 @@ def remote_share_cmd(email, role):
     vcs.remote_share(email, role)
 
 
+@cli.command()
+def status():
+    """Muestra archivos modificados, añadidos y sin seguimiento."""
+    vcs = SHIT()
+    vcs.status()
+
+
+@cli.command()
+@click.argument('commit_hash', required=True)
+@click.option('-m', '--mode', default='soft', help='Modo de reset')
+@click.option('--soft', is_flag=True, default=False, show_default=True, help='Equivalente a --mode=soft')
+def reset(commit_hash, mode, soft):
+    """Retrocede HEAD a un commit específico."""
+    vcs = SHIT()
+    # Si se usa --soft, ignorar el valor de mode
+    if soft:
+        mode = "soft"
+    vcs.reset(commit_hash, mode)
+
+
+@cli.command()
+def reflog():
+    """Muestra el historial de movimientos de HEAD."""
+    vcs = SHIT()
+    vcs.reflog()
+
+
 # Punto de entrada para la ejecución del script
 def main():
-    # Verificar si se está usando como comando oculto
-    if os.path.basename(sys.argv[0]) == "shit" or os.path.basename(sys.argv[0]) == "shit.py":
-        # Verificar y configurar el entorno
-        if LOCAL_MODE:
-            # En modo local, si aun no existe un repositorio local
-            if not os.path.exists(os.path.join(os.getcwd(), ".shit")):
-                setup_shit()
-        else:
-            # Modo centralizado (original)
-            if not os.path.exists(HOME_DIR):
-                setup_shit()
-        
-        # Procesar los argumentos
-        if len(sys.argv) > 1:
-            # Manejar comandos específicos
-            if sys.argv[1] == "init":
-                init_repo()
-            elif sys.argv[1] == "setup":
-                setup_shit()
-            elif sys.argv[1] == "add" and len(sys.argv) > 2 and sys.argv[2] == "-A":
-                vcs = SHIT()
-                vcs.add_all()
-            else:
-                # Pasar todos los argumentos directamente al comando
-                execute_shit_command(sys.argv[1:])
-        else:
-            print("Uso: shit <comando> [argumentos]")
-            print("Comandos disponibles:")
-            print("  init             - Inicializa un repositorio")
-            print("  add <archivo>    - Añade un archivo al control de versiones")
-            print("  add -A          - Añade todos los archivos modificados")
-            print("  commit <archivo> -m <mensaje> - Guarda una nueva versión")
-            print("  log <archivo>    - Muestra el historial de versiones")
-            print("  checkout <archivo> <versión> - Recupera una versión")
-            print("  branch create <nombre> - Crea una nueva rama")
-            print("  branch list      - Lista las ramas disponibles")
-            print("  branch switch <nombre> - Cambia a otra rama")
-            print("  branch merge <origen> [destino] - Fusiona ramas")
-    else:
-        # Usar la interfaz de Click para uso normal
-        cli()
+    # Siempre usar la interfaz de Click para todos los comandos
+    cli()
 
 
 if __name__ == '__main__':

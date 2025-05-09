@@ -14,6 +14,8 @@ import time
 import subprocess
 import click
 
+# Ejemplo de línea añadida para probar el comando reset --soft
+
 def crear_archivo_binario(nombre, num_datos=10):
     """Crea un archivo binario con datos aleatorios."""
     datos = [(random.randint(0, 1000), random.random()) for _ in range(num_datos)]

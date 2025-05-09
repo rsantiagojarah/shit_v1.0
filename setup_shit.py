@@ -23,6 +23,21 @@ def crear_directorio_oculto():
     if not os.path.exists(home_dir):
         os.makedirs(home_dir, exist_ok=True)
         print(f"Directorio oculto creado en: {home_dir}")
+        
+        # Ocultar el directorio en Windows
+        if platform.system() == "Windows":
+            try:
+                # Método 1: Usar attrib +h
+                subprocess.run(['attrib', '+h', home_dir], shell=True, check=False)
+            except Exception:
+                try:
+                    # Método 2: Usar cmd /c attrib +h
+                    cmd = f'cmd /c attrib +h "{home_dir}"'
+                    subprocess.run(cmd, shell=True, check=False)
+                except Exception as e:
+                    print(f"Advertencia: No se pudo ocultar el directorio {home_dir}: {str(e)}")
+                    print("El directorio está visible. Para ocultarlo manualmente, use:")
+                    print(f'attrib +h "{home_dir}"')
     
     # Crear subdirectorios necesarios
     repos_dir = os.path.join(home_dir, "repos")
@@ -32,7 +47,7 @@ def crear_directorio_oculto():
     return home_dir
 
 def copiar_archivos_necesarios(home_dir):
-    """Copia los archivos necesarios al directorio oculto"""
+    """Copia los archivos necesarios al directorio oculto, sobrescribiendo siempre los existentes"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     files_to_copy = ["shit.py", "drive_sync.py", "requirements.txt"]
     
@@ -41,8 +56,8 @@ def copiar_archivos_necesarios(home_dir):
         dst_file = os.path.join(home_dir, file)
         
         if os.path.exists(src_file):
-            shutil.copy2(src_file, dst_file)
-            print(f"Copiado: {file} a {home_dir}")
+            shutil.copy2(src_file, dst_file)  # Sobrescribe siempre
+            print(f"Copiado (actualizado): {file} a {home_dir}")
         else:
             print(f"Advertencia: No se encontró el archivo {file}")
     
@@ -110,11 +125,27 @@ def main():
     
     print("\n=== Instalación completada ===")
     print("Ahora puede utilizar el sistema desde cualquier ubicación con los siguientes comandos:")
-    print("  shit init         - Inicializar un repositorio oculto para el directorio actual")
-    print("  shit add archivo  - Añadir un archivo al control de versiones")
-    print("  shit commit archivo -m \"mensaje\"  - Guardar una versión")
-    print("  shit log archivo  - Ver historial de versiones")
-    print("  shit checkout archivo versión  - Recuperar una versión")
+    print("  shit --help                        - Ver ayuda y todos los comandos disponibles")
+    print("  shit init                          - Inicializar un repositorio oculto para el directorio actual")
+    print("  shit add archivo                   - Añadir un archivo al control de versiones")
+    print("  shit add -A                        - Añadir todos los archivos modificados")
+    print("  shit commit -m \"mensaje\"           - Guardar versión de todos los archivos en staging")
+    print("  shit commit archivo -m \"mensaje\"   - Guardar versión de un archivo específico")
+    print("  shit log archivo                   - Ver historial de versiones de un archivo")
+    print("  shit log                           - Ver historial de todos los archivos")
+    print("  shit status                        - Muestra archivos modificados, añadidos y sin seguimiento")
+    print("  shit checkout archivo versión      - Recuperar una versión")
+    print("  shit branch create nombre          - Crear una nueva rama")
+    print("  shit branch list                   - Listar ramas disponibles")
+    print("  shit branch switch nombre          - Cambiar de rama")
+    print("  shit branch merge origen [destino] - Fusionar ramas")
+    print("  shit remote init nombre            - Inicializar repositorio remoto en Google Drive")
+    print("  shit remote clone id               - Clonar desde Google Drive")
+    print("  shit remote push                   - Subir cambios al remoto")
+    print("  shit remote pull                   - Obtener cambios del remoto")
+    print("  shit remote share email            - Compartir el repositorio remoto")
+    print("  shit reset --soft <hash>           - Retrocede HEAD y deja cambios en staging")
+    print("  shit reflog                        - Ver historial de movimientos de HEAD")
     print("\nPara más información, consulte la documentación en README.md")
 
 if __name__ == "__main__":

@@ -5,16 +5,24 @@
 SHIT - Sistema de Historial Integral de Transformaciones
 """
 
-import os
-import sys
-import hashlib
-import zlib
-import json
-import click
-import datetime
-import shutil
-import time
-from pathlib import Path
+import os # para manejar archivos y directorios
+import sys # para manejar argumentos de la linea de comandos
+import hashlib # para calcular hashes de datos
+import zlib # para comprimir y descomprimir datos
+import json # para manejar datos en formato JSON
+import datetime # para manejar fechas y horas
+import shutil # para copiar y mover archivos
+import time # para manejar tiempos
+import subprocess # para ejecutar comandos del sistema
+import argparse # para manejar argumentos de la linea de comandos
+import platform # para obtener información del sistema operativo
+import getpass # para obtener el nombre del usuario 
+import click # para manejar comandos de la linea de comandos
+from pathlib import Path # para manejar rutas de archivos y directorios
+
+# Importar el módulo para manejar atributos de archivos en Windows
+if platform.system() == "Windows":
+    import ctypes
 
 # Importar el módulo de sincronización con Google Drive
 try:
@@ -23,6 +31,32 @@ try:
 except ImportError:
     DRIVE_SUPPORT = False
 
+# Ubicación del directorio oculto donde se almacenará el repositorio
+# Ahora usamos un directorio oculto local, similar a Git
+LOCAL_MODE = True  # Directorio oculto local (como Git)
+
+if platform.system() == "Windows":
+    HOME_DIR = os.path.join(os.environ.get("USERPROFILE"), ".shit")
+else:
+    HOME_DIR = os.path.join(os.environ.get("HOME"), ".shit")
+
+# Constante para atributos de archivo en Windows
+FILE_ATTRIBUTE_HIDDEN = 0x02
+
+def hide_directory(path):
+    """Oculta un directorio en Windows."""
+    if platform.system() == "Windows":
+        try:
+            # Asegurarse de que los permisos son correctos antes de ocultar
+            # En Windows, ocultar un directorio puede afectar los permisos de escritura
+            # para algunas operaciones
+            
+            # Usar la API de Windows para establecer el atributo de archivo oculto
+            ret = ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+            if ret == 0:  # Si falla, intentar con el comando attrib
+                subprocess.run(['attrib', '+h', str(path)], shell=True, check=False)
+        except Exception as e:
+            print(f"Advertencia: No se pudo ocultar el directorio {path}: {str(e)}")
 
 class SHIT:
     """Clase principal para el control de versiones de archivos binarios."""
@@ -83,9 +117,14 @@ class SHIT:
         # Cargar el índice actual
         self._load_index()
         
-        # Calcular ruta relativa al repositorio
-        rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-        str_path = str(rel_path)
+        try:
+            # Intentar calcular ruta relativa al repositorio
+            rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+            str_path = str(rel_path)
+        except ValueError:
+            # Si no es posible calcular la ruta relativa (porque el archivo está fuera del repo),
+            # usar el nombre del archivo como identificador
+            str_path = file_path.name
         
         # Añadir archivo al índice
         self.index[str_path] = {
@@ -94,7 +133,46 @@ class SHIT:
         }
         
         self._save_index()
-        print(f"Archivo {rel_path} añadido al control de versiones.")
+        print(f"Archivo {str_path} añadido al control de versiones.")
+        return True
+
+    def add_all(self):
+        """Añade todos los archivos modificados al control de versiones."""
+        # Cargar el índice actual
+        self._load_index()
+        
+        # Obtener todos los archivos en el directorio del repositorio
+        added_files = []
+        for root, _, files in os.walk(self.repo_path):
+            for file in files:
+                # Ignorar archivos en el directorio .shit
+                if '.shit' in root:
+                    continue
+                    
+                file_path = Path(root) / file
+                try:
+                    # Intentar calcular ruta relativa al repositorio
+                    rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+                    str_path = str(rel_path)
+                except ValueError:
+                    continue
+                
+                # Añadir archivo al índice si no está ya incluido
+                if str_path not in self.index:
+                    self.index[str_path] = {
+                        'added_at': datetime.datetime.now().isoformat(),
+                        'versions': []
+                    }
+                    added_files.append(str_path)
+        
+        if added_files:
+            self._save_index()
+            print("Archivos añadidos al control de versiones:")
+            for file in added_files:
+                print(f"  {file}")
+        else:
+            print("No hay archivos nuevos para añadir.")
+            
         return True
 
     def commit(self, file_path, message, branch=None):
@@ -105,16 +183,20 @@ class SHIT:
             print(f"Error: El archivo {file_path} no existe.")
             return False
             
-        # Calcular ruta relativa al repositorio
-        rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-        str_path = str(rel_path)
+        try:
+            # Intentar calcular ruta relativa al repositorio
+            rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+            str_path = str(rel_path)
+        except ValueError:
+            # Si no es posible calcular la ruta relativa, usar el nombre del archivo
+            str_path = file_path.name
         
         # Cargar el índice
         self._load_index()
         
         # Verificar que el archivo está en el índice
         if str_path not in self.index:
-            print(f"Error: El archivo {rel_path} no está bajo control de versiones. Usa 'add' primero.")
+            print(f"Error: El archivo {str_path} no está bajo control de versiones. Usa 'add' primero.")
             return False
             
         # Leer el contenido del archivo
@@ -133,17 +215,33 @@ class SHIT:
         branch_versions = [v for v in versions if v.get('branch', 'master') == branch]
         
         if branch_versions and branch_versions[-1]['hash'] == content_hash:
-            print(f"No hay cambios en el archivo {rel_path} desde la última versión en la rama {branch}.")
+            print(f"No hay cambios en el archivo {str_path} desde la última versión en la rama {branch}.")
             return False
             
         # Comprimir el contenido
         compressed = zlib.compress(content)
         
-        # Guardar el objeto
-        object_path = self.objects_dir / content_hash[:2] / content_hash[2:]
-        object_path.parent.mkdir(exist_ok=True)
-        with open(object_path, 'wb') as f:
-            f.write(compressed)
+        # Guardar el objeto - usando os.path para mayor compatibilidad con Windows
+        hash_prefix = content_hash[:2]
+        hash_suffix = content_hash[2:]
+        object_dir = os.path.join(self.objects_dir, hash_prefix)
+        object_file = os.path.join(object_dir, hash_suffix)
+        
+        # Crear el directorio del objeto de forma manual con os.makedirs
+        if not os.path.exists(object_dir):
+            try:
+                os.makedirs(object_dir, exist_ok=True)
+            except Exception as e:
+                print(f"Error al crear directorio {object_dir}: {str(e)}")
+                return False
+                
+        # Escribir el objeto
+        try:
+            with open(object_file, 'wb') as f:
+                f.write(compressed)
+        except Exception as e:
+            print(f"Error al escribir objeto {object_file}: {str(e)}")
+            return False
             
         # Actualizar el índice
         version_info = {
@@ -160,23 +258,27 @@ class SHIT:
         # Actualizar la referencia de la rama
         self._update_branch_ref(branch, content_hash)
         
-        print(f"Nueva versión de {rel_path} guardada (v{version_info['version']}) en rama {branch}.")
+        print(f"Nueva versión de {str_path} guardada (v{version_info['version']}) en rama {branch}.")
         return True
 
     def log(self, file_path, branch=None):
         """Muestra el historial de versiones de un archivo."""
         file_path = Path(file_path)
         
-        # Calcular ruta relativa al repositorio
-        rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-        str_path = str(rel_path)
+        try:
+            # Intentar calcular ruta relativa al repositorio
+            rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+            str_path = str(rel_path)
+        except ValueError:
+            # Si no es posible calcular la ruta relativa, usar el nombre del archivo
+            str_path = file_path.name
         
         # Cargar el índice
         self._load_index()
         
         # Verificar que el archivo está en el índice
         if str_path not in self.index:
-            print(f"Error: El archivo {rel_path} no está bajo control de versiones.")
+            print(f"Error: El archivo {str_path} no está bajo control de versiones.")
             return False
             
         # Obtener la rama actual si no se especificó una
@@ -188,10 +290,10 @@ class SHIT:
         versions = [v for v in all_versions if v.get('branch', 'master') == branch]
             
         if not versions:
-            print(f"El archivo {rel_path} no tiene versiones guardadas en la rama {branch}.")
+            print(f"El archivo {str_path} no tiene versiones guardadas en la rama {branch}.")
             return True
             
-        print(f"\nHistorial de versiones para {rel_path} (rama {branch}):")
+        print(f"\nHistorial de versiones para {str_path} (rama {branch}):")
         print("-" * 60)
         
         for version in versions:
@@ -202,7 +304,7 @@ class SHIT:
             print(f"Hash: {version['hash']}")
             print(f"Mensaje: {version['message']}")
             print("-" * 60)
-            
+        
         return True
 
     def checkout(self, file_path, version, branch=None):
@@ -210,16 +312,20 @@ class SHIT:
         file_path = Path(file_path)
         version = int(version)
         
-        # Calcular ruta relativa al repositorio
-        rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
-        str_path = str(rel_path)
+        try:
+            # Intentar calcular ruta relativa al repositorio
+            rel_path = file_path.resolve().relative_to(self.repo_path.resolve())
+            str_path = str(rel_path)
+        except ValueError:
+            # Si no es posible calcular la ruta relativa, usar el nombre del archivo
+            str_path = file_path.name
         
         # Cargar el índice
         self._load_index()
         
         # Verificar que el archivo está en el índice
         if str_path not in self.index:
-            print(f"Error: El archivo {rel_path} no está bajo control de versiones.")
+            print(f"Error: El archivo {str_path} no está bajo control de versiones.")
             return False
             
         # Obtener la rama actual si no se especificó una
@@ -231,7 +337,7 @@ class SHIT:
         versions = [v for v in all_versions if v.get('branch', 'master') == branch]
         
         if not versions:
-            print(f"El archivo {rel_path} no tiene versiones guardadas en la rama {branch}.")
+            print(f"El archivo {str_path} no tiene versiones guardadas en la rama {branch}.")
             return False
             
         if version < 1 or version > len(versions):
@@ -267,7 +373,7 @@ class SHIT:
         with open(file_path, 'wb') as f:
             f.write(content)
             
-        print(f"Archivo {rel_path} restaurado a la versión {version} de la rama {branch}.")
+        print(f"Archivo {str_path} restaurado a la versión {version} de la rama {branch}.")
         return True
 
     def branch_create(self, branch_name):
@@ -487,11 +593,25 @@ class SHIT:
 
     def _update_branch_ref(self, branch_name, content_hash):
         """Actualiza la referencia de una rama."""
-        branch_path = self.branches_dir / branch_name
-        self.branches_dir.mkdir(exist_ok=True)
+        # Usar os.path en lugar de pathlib para mayor compatibilidad con directorios ocultos
+        branch_dir = os.path.join(self.vcs_dir, "refs", "branches")
+        if not os.path.exists(branch_dir):
+            try:
+                os.makedirs(branch_dir, exist_ok=True)
+            except Exception as e:
+                print(f"Error al crear directorio de ramas {branch_dir}: {str(e)}")
+                return False
         
-        with open(branch_path, 'w') as f:
-            f.write(content_hash)
+        branch_path = os.path.join(branch_dir, branch_name)
+        
+        try:
+            with open(branch_path, 'w') as f:
+                f.write(content_hash)
+        except Exception as e:
+            print(f"Error al escribir referencia de rama {branch_path}: {str(e)}")
+            return False
+        
+        return True
 
     def _save_config(self):
         """Guarda la configuración en disco."""
@@ -518,7 +638,315 @@ class SHIT:
             self.index = {}
 
 
-# CLI con Click
+# Funciones para el modo local (como Git)
+def setup_shit():
+    """Configura el entorno para SHIT"""
+    # En modo local, no necesitamos un directorio global
+    if LOCAL_MODE:
+        # Copiar los scripts necesarios si no existen
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        files_to_copy = ["drive_sync.py", "requirements.txt"]
+        
+        # El directorio oculto está en el directorio actual
+        vcs_dir = os.path.join(os.getcwd(), ".shit")
+        if not os.path.exists(vcs_dir):
+            os.makedirs(vcs_dir, exist_ok=True)
+            # Ocultar el directorio en Windows
+            hide_directory(vcs_dir)
+        
+        for file in files_to_copy:
+            src_file = os.path.join(current_dir, file)
+            dst_file = os.path.join(vcs_dir, file)
+            
+            if os.path.exists(src_file) and not os.path.exists(dst_file):
+                shutil.copy2(src_file, dst_file)
+        
+        print(f"Configuración de SHIT completada en: {vcs_dir}")
+        return True
+    else:
+        # Modo centralizado (original)
+        if not os.path.exists(HOME_DIR):
+            os.makedirs(HOME_DIR, exist_ok=True)
+            print(f"Directorio oculto creado en: {HOME_DIR}")
+        
+        # Copiamos los scripts necesarios si no existen
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        files_to_copy = ["shit.py", "drive_sync.py", "requirements.txt"]
+        
+        for file in files_to_copy:
+            src_file = os.path.join(current_dir, file)
+            dst_file = os.path.join(HOME_DIR, file)
+            
+            if os.path.exists(src_file) and not os.path.exists(dst_file):
+                shutil.copy2(src_file, dst_file)
+                print(f"Copiado: {file} a {HOME_DIR}")
+        
+        # Crear un subdirectorio para los repositorios
+        repos_dir = os.path.join(HOME_DIR, "repos")
+        if not os.path.exists(repos_dir):
+            os.makedirs(repos_dir, exist_ok=True)
+            print(f"Directorio para repositorios creado en: {repos_dir}")
+        
+        print("Configuración de SHIT completada.")
+        return True
+
+def find_repo_root():
+    """Busca el directorio raíz del repositorio desde el directorio actual"""
+    if LOCAL_MODE:
+        # En modo local, buscar el directorio .shit en los directorios superiores
+        current = Path(os.getcwd())
+        while current != current.parent:  # Mientras no lleguemos a la raíz del sistema
+            shit_dir = current / '.shit'
+            if shit_dir.exists() and shit_dir.is_dir():
+                return str(current)
+            current = current.parent
+        return None
+    else:
+        # Modo centralizado (original)
+        current_dir = os.getcwd()
+        
+        # Buscar un mapeo en el archivo de configuración
+        mapping_file = os.path.join(HOME_DIR, "mapping.txt")
+        if os.path.exists(mapping_file):
+            with open(mapping_file, "r") as f:
+                for line in f:
+                    if line.strip():
+                        work_dir, repo_dir = line.strip().split("=")
+                        if current_dir.startswith(work_dir):
+                            return repo_dir
+        
+        return None
+
+def create_repo_mapping(work_dir, repo_dir):
+    """Crea un mapeo entre el directorio de trabajo y el repositorio oculto"""
+    mapping_file = os.path.join(HOME_DIR, "mapping.txt")
+    
+    # Crear o actualizar el mapeo
+    mappings = {}
+    if os.path.exists(mapping_file):
+        with open(mapping_file, "r") as f:
+            for line in f:
+                if line.strip():
+                    w_dir, r_dir = line.strip().split("=")
+                    mappings[w_dir] = r_dir
+    
+    mappings[work_dir] = repo_dir
+    
+    with open(mapping_file, "w") as f:
+        for w_dir, r_dir in mappings.items():
+            f.write(f"{w_dir}={r_dir}\n")
+    
+    return True
+
+def init_repo():
+    """Inicializa un repositorio para el directorio actual"""
+    if LOCAL_MODE:
+        # En modo local, crear el directorio .shit en el directorio actual
+        work_dir = os.getcwd()
+        
+        # Verificar si ya existe un repositorio
+        shit_dir = os.path.join(work_dir, ".shit")
+        if os.path.exists(shit_dir):
+            print(f"El repositorio ya existe en: {shit_dir}")
+            return True
+            
+        # Crear el directorio .shit si no existe
+        if not os.path.exists(shit_dir):
+            os.makedirs(shit_dir, exist_ok=True)
+            
+        # Crear subdirectorios necesarios
+        os.makedirs(os.path.join(shit_dir, "objects"), exist_ok=True)
+        os.makedirs(os.path.join(shit_dir, "refs", "branches"), exist_ok=True)
+        
+        # Crear archivos de configuración iniciales
+        config = {
+            'version': '1.0',
+            'created_at': datetime.datetime.now().isoformat(),
+        }
+        
+        with open(os.path.join(shit_dir, "config.json"), 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+            
+        with open(os.path.join(shit_dir, "index.json"), 'w', encoding='utf-8') as f:
+            json.dump({}, f, indent=2)
+            
+        # Inicializar rama master (por defecto)
+        with open(os.path.join(shit_dir, "HEAD"), 'w') as f:
+            f.write("master")
+            
+        # Ocultar el directorio en Windows
+        hide_directory(shit_dir)
+        
+        print(f"Repositorio inicializado en: {work_dir}")
+        return True
+    else:
+        # Modo centralizado (original)
+        work_dir = os.getcwd()
+        
+        # Crear un nombre para el repositorio basado en el directorio actual
+        repo_name = f"{Path(work_dir).name}_{getpass.getuser()}_{hash(work_dir) % 10000}"
+        repo_dir = os.path.join(HOME_DIR, "repos", repo_name)
+        
+        # Crear el directorio del repositorio
+        if not os.path.exists(repo_dir):
+            os.makedirs(repo_dir, exist_ok=True)
+        
+        # Inicializar un objeto SHIT para el repositorio oculto
+        vcs = SHIT(repo_dir)
+        result = vcs.init()
+        
+        if result:
+            # Crear mapeo entre el directorio de trabajo y el repositorio
+            create_repo_mapping(work_dir, repo_dir)
+            print(f"Repositorio inicializado para: {work_dir}")
+            print(f"Almacenado en: {repo_dir}")
+            return True
+        else:
+            print(f"Error al inicializar el repositorio")
+            return False
+
+def execute_shit_command(args):
+    """Ejecuta un comando de SHIT en el repositorio correspondiente"""
+    if LOCAL_MODE:
+        # En modo local, buscamos el directorio .shit o lo creamos
+        repo_dir = find_repo_root()
+        
+        if not repo_dir and args and args[0] != "init":
+            print("Error: No se encontró un repositorio para este directorio.")
+            print("Ejecute 'shit init' para inicializar un repositorio.")
+            return False
+        
+        # Si es un comando init, usamos el directorio actual
+        if args and args[0] == "init":
+            repo_dir = os.getcwd()
+    else:
+        # Modo centralizado (original)
+        repo_dir = find_repo_root()
+        
+        if not repo_dir:
+            print("Error: No se encontró un repositorio para este directorio.")
+            print("Ejecute 'shit init' para inicializar un repositorio.")
+            return False
+
+    # Crear una instancia de SHIT para el repositorio encontrado
+    vcs = SHIT(repo_dir)
+    
+    # Convertir rutas relativas a absolutas para los comandos que toman archivos
+    if args and args[0] in ["add", "commit", "log", "checkout"]:
+        if len(args) > 1 and not os.path.isabs(args[1]):
+            args[1] = os.path.abspath(args[1])
+    
+    # Ejecutar el comando correspondiente
+    if args and args[0] == "add":
+        if len(args) > 1 and args[1] == "-A":
+            return vcs.add_all()
+        elif len(args) > 1:
+            # Si estamos en el directorio de trabajo (no en el repo oculto)
+            # No intentar calcular ruta relativa, permitir que add maneje el path absoluto
+            abs_path = os.path.abspath(args[1])
+            return vcs.add(abs_path)
+        else:
+            print("Error: Debe especificar un archivo o usar la opción -A para añadir todos los archivos.")
+            return False
+    elif args and args[0] == "commit" and len(args) > 1:
+        if "-m" in args:
+            msg_index = args.index("-m") + 1
+            if msg_index < len(args):
+                message = args[msg_index]
+            else:
+                print("Error: Falta el mensaje después de -m")
+                return False
+        else:
+            print("Error: Debe especificar un mensaje con -m")
+            return False
+        
+        branch = None
+        if "-b" in args:
+            b_index = args.index("-b") + 1
+            if b_index < len(args):
+                branch = args[b_index]
+        
+        # Usar ruta absoluta 
+        abs_path = os.path.abspath(args[1])
+        return vcs.commit(abs_path, message, branch)
+    elif args and args[0] == "log" and len(args) > 1:
+        branch = None
+        if "-b" in args:
+            b_index = args.index("-b") + 1
+            if b_index < len(args):
+                branch = args[b_index]
+        
+        # Usar ruta absoluta
+        abs_path = os.path.abspath(args[1])
+        return vcs.log(abs_path, branch)
+    elif args and args[0] == "checkout" and len(args) > 2:
+        branch = None
+        if "-b" in args:
+            b_index = args.index("-b") + 1
+            if b_index < len(args):
+                branch = args[b_index]
+        
+        try:
+            version = int(args[2])
+            # Usar ruta absoluta
+            abs_path = os.path.abspath(args[1])
+            return vcs.checkout(abs_path, version, branch)
+        except ValueError:
+            print(f"Error: La versión debe ser un número entero")
+            return False
+    elif args and args[0] == "branch":
+        if len(args) > 1:
+            if args[1] == "create" and len(args) > 2:
+                return vcs.branch_create(args[2])
+            elif args[1] == "list":
+                return vcs.branch_list()
+            elif args[1] == "switch" and len(args) > 2:
+                return vcs.branch_switch(args[2])
+            elif args[1] == "merge" and len(args) > 2:
+                target = None
+                if len(args) > 3:
+                    target = args[3]
+                return vcs.branch_merge(args[2], target)
+        print("Comando de rama no válido")
+        return False
+    elif args and args[0] == "remote":
+        if len(args) > 1:
+            if args[1] == "init" and len(args) > 2:
+                return vcs.remote_init(args[2])
+            elif args[1] == "clone" and len(args) > 2:
+                target_dir = '.'
+                if len(args) > 3:
+                    target_dir = args[3]
+                return vcs.remote_clone(args[2], target_dir)
+            elif args[1] == "push":
+                branch = None
+                if "-b" in args:
+                    b_index = args.index("-b") + 1
+                    if b_index < len(args):
+                        branch = args[b_index]
+                return vcs.remote_push(branch)
+            elif args[1] == "pull":
+                branch = None
+                if "-b" in args:
+                    b_index = args.index("-b") + 1
+                    if b_index < len(args):
+                        branch = args[b_index]
+                return vcs.remote_pull(branch)
+            elif args[1] == "share" and len(args) > 2:
+                role = "writer"
+                if "-r" in args:
+                    r_index = args.index("-r") + 1
+                    if r_index < len(args):
+                        role = args[r_index]
+                return vcs.remote_share(args[2], role)
+        print("Comando remoto no válido")
+        return False
+    else:
+        print(f"Comando no reconocido o faltan argumentos: {args}")
+        return False
+
+
+# CLI con Click para la interfaz de línea de comandos estándar
 @click.group()
 def cli():
     """SHIT - Sistema de Historial Integral de Transformaciones."""
@@ -534,11 +962,17 @@ def init(directory):
 
 
 @cli.command()
-@click.argument('file', required=True, type=click.Path(exists=True))
-def add(file):
-    """Añade un archivo al control de versiones."""
+@click.argument('file', required=False, type=click.Path(exists=True))
+@click.option('-A', '--all', is_flag=True, help='Añade todos los archivos modificados')
+def add(file, all):
+    """Añade archivos al control de versiones."""
     vcs = SHIT()
-    vcs.add(file)
+    if all:
+        vcs.add_all()
+    elif file:
+        vcs.add(file)
+    else:
+        print("Error: Debe especificar un archivo o usar la opción -A para añadir todos los archivos.")
 
 
 @cli.command()
@@ -660,5 +1094,46 @@ def remote_share_cmd(email, role):
     vcs.remote_share(email, role)
 
 
+# Punto de entrada para la ejecución del script
+def main():
+    # Verificar si se está usando como comando oculto
+    if os.path.basename(sys.argv[0]) == "shit" or os.path.basename(sys.argv[0]) == "shit.py":
+        # Verificar y configurar el entorno
+        if LOCAL_MODE:
+            # En modo local, si aun no existe un repositorio local
+            if not os.path.exists(os.path.join(os.getcwd(), ".shit")):
+                setup_shit()
+        else:
+            # Modo centralizado (original)
+            if not os.path.exists(HOME_DIR):
+                setup_shit()
+        
+        # Procesar los argumentos
+        if len(sys.argv) > 1:
+            # Manejar comandos específicos
+            if sys.argv[1] == "init":
+                init_repo()
+            elif sys.argv[1] == "setup":
+                setup_shit()
+            else:
+                # Pasar todos los argumentos directamente al comando
+                execute_shit_command(sys.argv[1:])
+        else:
+            print("Uso: shit <comando> [argumentos]")
+            print("Comandos disponibles:")
+            print("  init             - Inicializa un repositorio")
+            print("  add <archivo>    - Añade un archivo al control de versiones")
+            print("  commit <archivo> -m <mensaje> - Guarda una nueva versión")
+            print("  log <archivo>    - Muestra el historial de versiones")
+            print("  checkout <archivo> <versión> - Recupera una versión")
+            print("  branch create <nombre> - Crea una nueva rama")
+            print("  branch list      - Lista las ramas disponibles")
+            print("  branch switch <nombre> - Cambia a otra rama")
+            print("  branch merge <origen> [destino] - Fusiona ramas")
+    else:
+        # Usar la interfaz de Click para uso normal
+        cli()
+
+
 if __name__ == '__main__':
-    cli() 
+    main() 

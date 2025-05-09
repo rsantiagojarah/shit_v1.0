@@ -9,6 +9,7 @@ Permite sincronizar repositorios locales con Google Drive para colaboración.
 import os
 import json
 import pickle
+import time
 from pathlib import Path
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -519,6 +520,3 @@ class DriveSync:
                 self.drive_config = json.load(f)
         else:
             self.drive_config = {}
-
-# Añadir esta línea para que funcione el import de time
-import time 
